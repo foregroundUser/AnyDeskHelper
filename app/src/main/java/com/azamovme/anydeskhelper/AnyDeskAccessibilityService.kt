@@ -9,6 +9,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.graphics.Rect
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -44,7 +45,6 @@ class AnyDeskAccessibilityService : AccessibilityService() {
         private const val SHARE_SCREEN_CANCEL_BUTTON_ID = "android:id/button2"
 
         // Share chooser IDs
-        private const val SHARE_CHOOSER_LIST_ID = "android:id/list"
         private const val SHARE_CHOOSER_TEXT_ID = "android:id/text1"
     }
 
@@ -108,9 +108,7 @@ class AnyDeskAccessibilityService : AccessibilityService() {
                         }
                     }
                     SYSTEMUI_PACKAGE -> {
-                        if (currentStep.get() in 1..3) {
-                            processSystemUIWindow()
-                        }
+                        processSystemUIWindow()
                     }
                 }
             }, 400)
@@ -173,14 +171,55 @@ class AnyDeskAccessibilityService : AccessibilityService() {
                             Log.d(TAG, "✅ Spinner handling completed")
                             currentStep.set(2)
                             lastActivityTime = System.currentTimeMillis()
+                        } else {
+                            // Fallback: if spinner not found, try to detect chooser directly
+                            if (detectShareChooser(rootNode)) {
+                                Log.d(TAG, "🔄 Fallback: Found chooser directly, moving to step 2")
+                                currentStep.set(2)
+                                lastActivityTime = System.currentTimeMillis()
+                                handler.postDelayed({
+                                    processSystemUIWindow()
+                                }, 500)
+                            }
                         }
                     }
                     2 -> {
                         // Step 2: Handle chooser dialog
-                        if (handleShareChooser(rootNode)) {
-                            Log.d(TAG, "✅ Chooser handling completed")
-                            currentStep.set(3)
-                            lastActivityTime = System.currentTimeMillis()
+                        if (detectShareChooser(rootNode)) {
+                            Log.d(TAG, "✅ Chooser dialog detected")
+                            if (handleShareChooser(rootNode)) {
+                                Log.d(TAG, "✅ Chooser handling completed")
+                                currentStep.set(3)
+                                lastActivityTime = System.currentTimeMillis()
+
+                                // Wait a bit then process main dialog
+                                handler.postDelayed({
+                                    processSystemUIWindow()
+                                }, 800)
+                            }
+                        } else {
+                            // Chooser not found, maybe already selected or closed
+                            Log.d(TAG, "⚠️ Chooser not found, checking if we're back to main dialog")
+
+                            // Check if we're back in main dialog with "Share entire screen" selected
+                            if (detectShareScreenDialog(rootNode)) {
+                                val spinner = findNodeById(rootNode, SHARE_SCREEN_MODE_OPTIONS_ID)
+                                if (spinner != null) {
+                                    val spinnerText = getSpinnerText(spinner)
+                                    safeRecycle(spinner)
+
+                                    if (spinnerText.contains("entire screen", ignoreCase = true)) {
+                                        Log.d(TAG, "✅ Already in main dialog with 'Share entire screen' selected")
+                                        currentStep.set(3)
+                                        lastActivityTime = System.currentTimeMillis()
+
+                                        // Process share button immediately
+                                        handler.postDelayed({
+                                            processSystemUIWindow()
+                                        }, 500)
+                                    }
+                                }
+                            }
                         }
                     }
                     3 -> {
@@ -191,6 +230,14 @@ class AnyDeskAccessibilityService : AccessibilityService() {
                             screenShareProcessed = true
                             lastActivityTime = System.currentTimeMillis()
                             showToastNotification("✅ Screen sharing started")
+                        } else {
+                            Log.w(TAG, "⚠️ Failed to click share button, retrying...")
+                            // Retry after delay
+                            handler.postDelayed({
+                                if (currentStep.get() == 3) {
+                                    processSystemUIWindow()
+                                }
+                            }, 1000)
                         }
                     }
                 }
@@ -202,6 +249,119 @@ class AnyDeskAccessibilityService : AccessibilityService() {
                 isProcessing = false
             }
         }
+    }
+
+    /**
+     * Detect SystemUI Share Screen dialog
+     */
+    private fun detectShareScreenDialog(rootNode: AccessibilityNodeInfo): Boolean {
+        try {
+            // 1. Dialog ID bo'yicha tekshirish
+            val dialog = findNodeById(rootNode, SHARE_SCREEN_DIALOG_ID)
+            if (dialog != null) {
+                safeRecycle(dialog)
+                Log.d(TAG, "✓ Share screen dialog ID found")
+                return true
+            }
+
+            // 2. Title bo'yicha tekshirish
+            val title = findNodeById(rootNode, SHARE_SCREEN_TITLE_ID)
+            if (title != null) {
+                val titleText = title.text?.toString()?.trim()
+                safeRecycle(title)
+                if (titleText?.contains("Share your screen", ignoreCase = true) == true) {
+                    Log.d(TAG, "✓ Share screen title found: $titleText")
+                    return true
+                }
+            }
+
+            // 3. Spinner bo'yicha tekshirish
+            val spinner = findNodeById(rootNode, SHARE_SCREEN_MODE_OPTIONS_ID)
+            if (spinner != null) {
+                safeRecycle(spinner)
+                Log.d(TAG, "✓ Share screen spinner found")
+                return true
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error detecting share screen dialog", e)
+        }
+
+        return false
+    }
+
+    private fun detectShareChooser(rootNode: AccessibilityNodeInfo): Boolean {
+        try {
+            // Method 1: Check for both text options
+            val entireScreen = rootNode.findAccessibilityNodeInfosByText("Share entire screen")
+            val oneApp = rootNode.findAccessibilityNodeInfosByText("Share one app")
+
+            val hasBoth = entireScreen.isNotEmpty() && oneApp.isNotEmpty()
+
+            entireScreen.forEach { safeRecycle(it) }
+            oneApp.forEach { safeRecycle(it) }
+
+            if (hasBoth) {
+                Log.d(TAG, "✓ Chooser dialog detected by text")
+                return true
+            }
+
+            // Method 2: Check for ListView with 2 items
+            val listViews = rootNode.findAccessibilityNodeInfosByViewId("android.widget.ListView")
+            if (listViews.isNotEmpty()) {
+                for (listView in listViews) {
+                    if (listView.childCount == 2) {
+                        var hasShareText = false
+                        for (i in 0 until listView.childCount) {
+                            val child = listView.getChild(i)
+                            if (child != null) {
+                                val childText = child.text?.toString()?.trim()
+                                if (childText != null &&
+                                    (childText.contains("Share", ignoreCase = true))) {
+                                    hasShareText = true
+                                }
+                                safeRecycle(child)
+                            }
+                        }
+                        if (hasShareText) {
+                            listViews.forEach { safeRecycle(it) }
+                            return true
+                        }
+                    }
+                }
+                listViews.forEach { safeRecycle(it) }
+            }
+
+            // Method 3: Traverse and look for specific bounds
+            val chooserNodes = mutableListOf<AccessibilityNodeInfo>()
+            traverseNodes(rootNode) { node ->
+                try {
+                    // Get bounds safely
+                    val bounds = Rect()
+                    node.getBoundsInScreen(bounds)
+
+                    // Check for chooser bounds [89,1021][991,1399]
+                    if (bounds.left == 89 && bounds.top == 1021 &&
+                        bounds.right == 991 && bounds.bottom == 1399) {
+                        chooserNodes.add(node)
+                    }
+                } catch (e: Exception) {
+                    // Ignore bounds errors
+                }
+                false // continue traversal
+            }
+
+            if (chooserNodes.isNotEmpty()) {
+                chooserNodes.forEach { safeRecycle(it) }
+                Log.d(TAG, "✓ Chooser detected by bounds")
+                return true
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error detecting share chooser", e)
+        }
+
+        return false
     }
 
     /**
@@ -291,36 +451,10 @@ class AnyDeskAccessibilityService : AccessibilityService() {
      * Find spinner by traversal
      */
     private fun findSpinnerByTraversal(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val queue = mutableListOf<AccessibilityNodeInfo>()
-        queue.add(rootNode)
-
-        while (queue.isNotEmpty()) {
-            val current = queue.removeAt(0)
-
-            try {
-                if (current.className?.contains("Spinner", ignoreCase = true) == true &&
-                    current.isClickable && current.isEnabled) {
-                    return current
-                }
-
-                // Add children
-                for (i in 0 until current.childCount) {
-                    val child = current.getChild(i)
-                    if (child != null) {
-                        queue.add(child)
-                    }
-                }
-
-                // Don't recycle root node here
-                if (current != rootNode) {
-                    safeRecycle(current)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in traversal", e)
-            }
+        return findNodeByTraversal(rootNode) { node ->
+            node.className?.contains("Spinner", ignoreCase = true) == true &&
+                    node.isClickable && node.isEnabled
         }
-
-        return null
     }
 
     /**
@@ -328,40 +462,47 @@ class AnyDeskAccessibilityService : AccessibilityService() {
      */
     private fun handleShareChooser(rootNode: AccessibilityNodeInfo): Boolean {
         try {
-            Log.d(TAG, "🎯 Step 2: Looking for chooser dialog...")
+            Log.d(TAG, "🎯 Step 2: Handling chooser dialog...")
 
-            // Check if this is the chooser by looking for the list view
-            val listView = findNodeById(rootNode, SHARE_CHOOSER_LIST_ID)
-            if (listView == null) {
-                // Try to find ListView by class name
-                val listViews = rootNode.findAccessibilityNodeInfosByViewId("android.widget.ListView")
-                if (listViews.isEmpty()) {
-                    Log.d(TAG, "⚠️ Chooser ListView not found")
-                    listViews.forEach { safeRecycle(it) }
-                    return false
-                }
-                listViews.forEach { safeRecycle(it) }
-            }
-            safeRecycle(listView)
-
-            // Find "Share entire screen" option
+            // Find "Share entire screen" option using multiple methods
             val entireScreenOption = findShareEntireScreenOption(rootNode)
             if (entireScreenOption != null) {
                 Log.d(TAG, "✓ Found 'Share entire screen' option, clicking...")
+
+                // Log the node details for debugging
+                Log.d(TAG, "Node details - Class: ${entireScreenOption.className}, " +
+                        "Clickable: ${entireScreenOption.isClickable}, " +
+                        "Enabled: ${entireScreenOption.isEnabled}")
+
                 if (performClick(entireScreenOption)) {
                     Log.d(TAG, "✅ 'Share entire screen' selected")
-
-                    // Wait for main dialog to reappear
-                    handler.postDelayed({
-                        Log.d(TAG, "⏳ Returning to main dialog...")
-                    }, 500)
+                    safeRecycle(entireScreenOption)
                     return true
                 } else {
-                    Log.w(TAG, "⚠️ Failed to click 'Share entire screen'")
+                    Log.w(TAG, "⚠️ Failed to click 'Share entire screen', trying alternative methods")
+
+                    // Try alternative click methods
+                    if (performAlternativeClick(entireScreenOption)) {
+                        Log.d(TAG, "✅ 'Share entire screen' selected via alternative click")
+                        safeRecycle(entireScreenOption)
+                        return true
+                    }
                 }
                 safeRecycle(entireScreenOption)
             } else {
                 Log.w(TAG, "⚠️ 'Share entire screen' option not found in chooser")
+
+                // Try to find by coordinates (bounds from hierarchy)
+                val optionByBounds = findOptionByBounds(rootNode, 89, 1210, 991, 1399)
+                if (optionByBounds != null && optionByBounds.isClickable) {
+                    Log.d(TAG, "✓ Found option by bounds, clicking...")
+                    if (performClick(optionByBounds)) {
+                        Log.d(TAG, "✅ Option clicked by bounds")
+                        safeRecycle(optionByBounds)
+                        return true
+                    }
+                    safeRecycle(optionByBounds)
+                }
             }
 
         } catch (e: Exception) {
@@ -373,22 +514,17 @@ class AnyDeskAccessibilityService : AccessibilityService() {
 
     private fun findShareEntireScreenOption(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         try {
-            // Method 1: Find by text
+            // Method 1: Find by text and get clickable parent
             val nodes = rootNode.findAccessibilityNodeInfosByText("Share entire screen")
             for (node in nodes) {
-                // Look for the clickable parent (usually LinearLayout)
+                // Look for clickable parent (LinearLayout)
                 var target: AccessibilityNodeInfo? = node
+                var parent = node.parent
 
-                // If current node isn't clickable, check its parents
-                while (target != null && !target.isClickable) {
-                    val parent = target.parent
-                    if (parent != null) {
-                        // Don't recycle target yet if we're moving to parent
-                        if (target != node) safeRecycle(target)
-                        target = parent
-                    } else {
-                        break
-                    }
+                while (parent != null && target != null && !target.isClickable) {
+                    safeRecycle(target)
+                    target = parent
+                    parent = parent.parent
                 }
 
                 if (target != null && target.isClickable) {
@@ -396,32 +532,30 @@ class AnyDeskAccessibilityService : AccessibilityService() {
                     nodes.forEach { if (it != node) safeRecycle(it) }
                     return target
                 }
-
                 safeRecycle(target)
             }
             nodes.forEach { safeRecycle(it) }
 
-            // Method 2: Find by ID and text
-            val textNodes = rootNode.findAccessibilityNodeInfosByViewId(SHARE_CHOOSER_TEXT_ID)
-            for (node in textNodes) {
-                val text = node.text?.toString()?.trim()
-                if (text.equals("Share entire screen", ignoreCase = true)) {
-                    // Find clickable parent
-                    var parent = node.parent
-                    while (parent != null && !parent.isClickable) {
-                        val nextParent = parent.parent
-                        safeRecycle(parent)
-                        parent = nextParent
+            // Method 2: Find LinearLayout with text child containing "Share entire screen"
+            val linearLayouts = rootNode.findAccessibilityNodeInfosByViewId("android.widget.LinearLayout")
+            for (layout in linearLayouts) {
+                if (layout.isClickable) {
+                    // Check children for the text
+                    for (i in 0 until layout.childCount) {
+                        val child = layout.getChild(i)
+                        if (child != null) {
+                            val text = child.text?.toString()?.trim()
+                            if (text != null && text.contains("Share entire screen", ignoreCase = true)) {
+                                linearLayouts.forEach { if (it != layout) safeRecycle(it) }
+                                safeRecycle(child)
+                                return layout
+                            }
+                            safeRecycle(child)
+                        }
                     }
-
-                    if (parent != null && parent.isClickable) {
-                        textNodes.forEach { if (it != node) safeRecycle(it) }
-                        return parent
-                    }
-                    safeRecycle(parent)
                 }
             }
-            textNodes.forEach { safeRecycle(it) }
+            linearLayouts.forEach { safeRecycle(it) }
 
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error finding share entire screen", e)
@@ -430,20 +564,26 @@ class AnyDeskAccessibilityService : AccessibilityService() {
         return null
     }
 
+    private fun findOptionByBounds(rootNode: AccessibilityNodeInfo, left: Int, top: Int, right: Int, bottom: Int): AccessibilityNodeInfo? {
+        return findNodeByTraversal(rootNode) { node ->
+            try {
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                bounds.left == left && bounds.top == top &&
+                        bounds.right == right && bounds.bottom == bottom &&
+                        node.isClickable
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
     /**
      * Step 3: Handle share button in main dialog
      */
     private fun handleShareButton(rootNode: AccessibilityNodeInfo): Boolean {
         try {
             Log.d(TAG, "🎯 Step 3: Looking for 'Share screen' button...")
-
-            // First verify we're in the main dialog
-            val dialog = findNodeById(rootNode, SHARE_SCREEN_DIALOG_ID)
-            if (dialog == null) {
-                Log.d(TAG, "⚠️ Main dialog not found for share button")
-                return false
-            }
-            safeRecycle(dialog)
 
             // Check spinner text to confirm "Share entire screen" is selected
             val spinner = findNodeById(rootNode, SHARE_SCREEN_MODE_OPTIONS_ID)
@@ -458,7 +598,7 @@ class AnyDeskAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // Find and click the "Share screen" button
+            // Find and click the "Share screen" button using multiple methods
             val shareButton = findShareScreenButton(rootNode)
             if (shareButton != null) {
                 Log.d(TAG, "✓ Found 'Share screen' button, clicking...")
@@ -467,11 +607,38 @@ class AnyDeskAccessibilityService : AccessibilityService() {
                     safeRecycle(shareButton)
                     return true
                 } else {
-                    Log.w(TAG, "⚠️ Failed to click 'Share screen' button")
+                    Log.w(TAG, "⚠️ Failed to click 'Share screen' button, trying alternative...")
+
+                    // Try alternative click
+                    if (performAlternativeClick(shareButton)) {
+                        Log.d(TAG, "✅ 'Share screen' button clicked via alternative")
+                        safeRecycle(shareButton)
+                        return true
+                    }
                 }
                 safeRecycle(shareButton)
             } else {
                 Log.w(TAG, "⚠️ 'Share screen' button not found")
+
+                // Try to find by bounds from hierarchy
+                val buttonByBounds = findNodeByTraversal(rootNode) { node ->
+                    try {
+                        node.className?.contains("Button") == true &&
+                                node.isClickable
+                    } catch (e: Exception) {
+                        false
+                    }
+                }
+
+                if (buttonByBounds != null) {
+                    Log.d(TAG, "✓ Found button by traversal, clicking...")
+                    if (performClick(buttonByBounds)) {
+                        Log.d(TAG, "✅ Button clicked")
+                        safeRecycle(buttonByBounds)
+                        return true
+                    }
+                    safeRecycle(buttonByBounds)
+                }
             }
 
         } catch (e: Exception) {
@@ -735,6 +902,118 @@ class AnyDeskAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error performing click", e)
             false
+        }
+    }
+
+    private fun performAlternativeClick(node: AccessibilityNodeInfo): Boolean {
+        return try {
+            Log.d(TAG, "🔄 Trying alternative click methods...")
+
+            // Method 1: Try long click
+            if (node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)) {
+                Log.d(TAG, "✓ Long click successful")
+                return true
+            }
+
+            // Method 2: Try accessibility focus and click
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
+                if (node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)) {
+                    Thread.sleep(100)
+                    if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                        Log.d(TAG, "✓ Focus + click successful")
+                        return true
+                    }
+                }
+            }
+
+            // Method 3: Try to get parent and click
+            val parent = node.parent
+            if (parent != null && parent.isClickable) {
+                Log.d(TAG, "🔄 Trying to click parent instead...")
+                if (performClick(parent)) {
+                    safeRecycle(parent)
+                    return true
+                }
+                safeRecycle(parent)
+            }
+
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error in alternative click", e)
+            false
+        }
+    }
+
+    private fun findNodeByTraversal(
+        rootNode: AccessibilityNodeInfo,
+        predicate: (AccessibilityNodeInfo) -> Boolean
+    ): AccessibilityNodeInfo? {
+        val queue = mutableListOf<AccessibilityNodeInfo>()
+        queue.add(rootNode)
+
+        while (queue.isNotEmpty()) {
+            val current = queue.removeAt(0)
+
+            try {
+                if (predicate(current)) {
+                    // Recycle remaining nodes in queue
+                    queue.forEach { if (it != current) safeRecycle(it) }
+                    return current
+                }
+
+                // Add children
+                for (i in 0 until current.childCount) {
+                    val child = current.getChild(i)
+                    if (child != null) {
+                        queue.add(child)
+                    }
+                }
+
+                // Don't recycle root node here
+                if (current != rootNode) {
+                    safeRecycle(current)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in traversal", e)
+            }
+        }
+
+        return null
+    }
+
+    private fun traverseNodes(
+        rootNode: AccessibilityNodeInfo,
+        action: (AccessibilityNodeInfo) -> Boolean
+    ) {
+        val queue = mutableListOf<AccessibilityNodeInfo>()
+        queue.add(rootNode)
+
+        while (queue.isNotEmpty()) {
+            val current = queue.removeAt(0)
+
+            try {
+                val shouldStop = action(current)
+                if (shouldStop) {
+                    queue.forEach { safeRecycle(it) }
+                    safeRecycle(current)
+                    return
+                }
+
+                // Add children
+                for (i in 0 until current.childCount) {
+                    val child = current.getChild(i)
+                    if (child != null) {
+                        queue.add(child)
+                    }
+                }
+
+                // Don't recycle root node here
+                if (current != rootNode) {
+                    safeRecycle(current)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in traversal", e)
+            }
         }
     }
 
