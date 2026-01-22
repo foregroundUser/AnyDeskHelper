@@ -1,5 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
+        <color name="black">#FF000000</color>
+        <color name="white">#FFFFFFFF</color>
+        <color name="primary">#000000</color>
+        <color name="primary800">#333333</color>
+        <color name="primary900">#1A1A1A</color>
+        <color name="primary700">#4D4D4D</color>
+        <color name="primary600">#4D4D4D</color>
+        <color name="primary500">#808080</color>
+        <color name="primary400">#999999</color>
+        <color name="primary300">#B3B3B3</color>
+        <color name="primary100">#E6E6E6</color>
+        <color name="primary0">#FFFF</color>
+        <color name="card_background">#efeef6</color>
+        <color name="text_primary">#1A1A1A</color>
+        <color name="text_secondary">#4D4D4D</color>
 </resources>
