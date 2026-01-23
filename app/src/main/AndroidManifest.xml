@@ -14,6 +14,7 @@
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
     <application
+        android:name=".MyApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -64,7 +65,9 @@
                 android:resource="@xml/anydesk_accessibility_service" />
         </service>
 
-
+        <meta-data
+            android:name="com.bugsnag.android.API_KEY"
+            android:value="d3c7cb40d77095e830659b2360e3a895" />
     </application>
 
 </manifest>

@@ -3,18 +3,16 @@ package com.azamovme.anydeskhelper
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Intent
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.graphics.Rect
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.concurrent.atomic.AtomicInteger
+import com.bugsnag.android.Bugsnag
 
 class AnyDeskAccessibilityService : AccessibilityService() {
 
@@ -22,29 +20,19 @@ class AnyDeskAccessibilityService : AccessibilityService() {
         const val TAG = "AnyDeskHelper"
         var isServiceEnabled = false
 
-        // Package names
         private const val ANYDESK_PACKAGE = "com.anydesk.anydeskandroid"
         private const val SYSTEMUI_PACKAGE = "com.android.systemui"
 
         // AnyDesk dialog IDs
         private const val DIALOG_TITLE_ID = "com.anydesk.anydeskandroid:id/dialog_accept_title_text"
-        private const val DIALOG_MSG_ID = "com.anydesk.anydeskandroid:id/dialog_accept_msg"
-        private const val PERMISSION_PROFILE_ID = "com.anydesk.anydeskandroid:id/dialog_accept_profiles_list"
-        private const val PERMISSIONS_TITLE_ID = "com.anydesk.anydeskandroid:id/dialog_accept_permissions_title"
         private const val ACCEPT_BUTTON_ID = "android:id/button1"
-        private const val DISMISS_BUTTON_ID = "android:id/button2"
-        private const val ADDRESS_TEXT_ID = "com.anydesk.anydeskandroid:id/dialog_accept_address"
-        private const val ALIAS_TEXT_ID = "com.anydesk.anydeskandroid:id/dialog_accept_alias"
-        private const val PERMISSIONS_CONTAINER_ID = "com.anydesk.anydeskandroid:id/dialog_accept_permissions_container"
 
-        // SystemUI Share Screen dialog IDs
-        private const val SHARE_SCREEN_DIALOG_ID = "com.android.systemui:id/screen_share_permission_dialog"
-        private const val SHARE_SCREEN_TITLE_ID = "com.android.systemui:id/screen_share_dialog_title"
-        private const val SHARE_SCREEN_MODE_OPTIONS_ID = "com.android.systemui:id/screen_share_mode_options"
+        // System UI Share Screen dialog IDs
+        private const val SHARE_SCREEN_DIALOG_ID =
+            "com.android.systemui:id/screen_share_permission_dialog"
+        private const val SHARE_SCREEN_SPINNER_ID =
+            "com.android.systemui:id/screen_share_mode_options"
         private const val SHARE_SCREEN_NEXT_BUTTON_ID = "android:id/button1"
-        private const val SHARE_SCREEN_CANCEL_BUTTON_ID = "android:id/button2"
-
-        // Share chooser IDs
         private const val SHARE_CHOOSER_TEXT_ID = "android:id/text1"
     }
 
@@ -52,32 +40,51 @@ class AnyDeskAccessibilityService : AccessibilityService() {
     private val coroutineScope = CoroutineScope(Dispatchers.IO)
     private var isProcessing = false
     private var lastProcessTime = 0L
-    private val MIN_PROCESS_INTERVAL = 800L
-
-    // Status monitoring
-    private var dialogDetectedCount = 0
-    private var autoAcceptCount = 0
-    private var screenShareProcessed = false
-    private var currentStep = AtomicInteger(0)
+    private val MIN_PROCESS_INTERVAL = 500L
 
     // State management
-    private var lastActivityTime = System.currentTimeMillis()
-    private val STATE_TIMEOUT = 30000L // 30 seconds
+    private var anydeskAccepted = false
+    private var currentStep =
+        0 // 0: wait for AnyDesk, 1: wait for share dialog, 2: wait for chooser, 3: wait for share button
+
+    // Polling mechanism
+    private var isPollingActive = false
+    private val pollingRunnable = Runnable { pollForWindows() }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d(TAG, "🟢 Accessibility Service Connected")
         isServiceEnabled = true
 
+        // Initialize Bugsnag
+        try {
+            Bugsnag.start(this)
+            notifyBugsnag(
+                "Service Connected", mapOf(
+                    "state" to "CONNECTED",
+                    "step" to currentStep.toString(),
+                    "anydeskAccepted" to anydeskAccepted.toString()
+                )
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Bugsnag initialization failed", e)
+        }
+
         val info = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                    AccessibilityEvent.TYPE_VIEW_CLICKED or
+                    AccessibilityEvent.TYPE_VIEW_FOCUSED
+
             packageNames = arrayOf(ANYDESK_PACKAGE, SYSTEMUI_PACKAGE)
             notificationTimeout = 100
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+            flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                    AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
         }
 
         this.serviceInfo = info
+        startPolling()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -86,165 +93,83 @@ class AnyDeskAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Check for timeout reset
-        checkTimeoutReset()
+        // Log event for debugging
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                Log.d(TAG, "📱 Window state changed - Package: $packageName")
+            }
 
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastProcessTime < MIN_PROCESS_INTERVAL) {
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                Log.d(TAG, "📄 Window content changed - Package: $packageName")
+            }
+
+            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                Log.d(TAG, "🖱️ View clicked - Package: $packageName")
+            }
+
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
+                Log.d(TAG, "🎯 View focused - Package: $packageName")
+            }
+        }
+
+        // Process event immediately
+        handler.removeCallbacksAndMessages(null)
+        handler.postDelayed({
+            processCurrentWindow()
+        }, 200)
+    }
+
+    /**
+     * Process current window based on state
+     */
+    private fun processCurrentWindow() {
+        if (isProcessing) {
             return
         }
 
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            Log.d(TAG, "📱 Window changed: $packageName, Step: ${currentStep.get()}")
-            lastProcessTime = currentTime
-            lastActivityTime = currentTime
-
-            handler.removeCallbacksAndMessages(null)
-            handler.postDelayed({
-                when (packageName) {
-                    ANYDESK_PACKAGE -> {
-                        if (currentStep.get() == 0) {
-                            processAnyDeskWindow()
-                        }
-                    }
-                    SYSTEMUI_PACKAGE -> {
-                        processSystemUIWindow()
-                    }
-                }
-            }, 400)
-        }
-    }
-
-    private fun processAnyDeskWindow() {
-        if (isProcessing) return
-
         isProcessing = true
         coroutineScope.launch {
             try {
-                delay(300)
-                val rootNode = rootInActiveWindow ?: run {
+                val rootNode = rootInActiveWindow
+                if (rootNode == null) {
+                    Log.d(TAG, "⚠️ Root node is null")
                     isProcessing = false
                     return@launch
                 }
 
-                if (detectIncomingDialog(rootNode)) {
-                    dialogDetectedCount++
-                    Log.d(TAG, "✅ AnyDesk dialog detected! Count: $dialogDetectedCount")
+                val packageName = rootNode.packageName?.toString()
+                Log.d(
+                    TAG,
+                    "🔍 Processing - Package: $packageName, Step: $currentStep, AnyDeskAccepted: $anydeskAccepted"
+                )
 
-                    if (currentStep.get() == 0) {
-                        val accepted = performAutoAccept(rootNode)
-                        if (accepted) {
-                            Log.d(TAG, "✅ AnyDesk accept successful")
-                            currentStep.set(1)
-                            lastActivityTime = System.currentTimeMillis()
-                        }
+                when {
+                    !anydeskAccepted && packageName == ANYDESK_PACKAGE -> {
+                        handleAnyDeskDialog(rootNode)
+                    }
+
+                    anydeskAccepted && packageName == SYSTEMUI_PACKAGE -> {
+                        handleSystemUIFlow(rootNode)
+                    }
+
+                    else -> {
+                        Log.d(
+                            TAG,
+                            "📭 Not processing - Package: $packageName doesn't match current state"
+                        )
                     }
                 }
 
                 safeRecycle(rootNode)
             } catch (e: Exception) {
-                Log.e(TAG, "❌ Error in AnyDesk window", e)
-            } finally {
-                isProcessing = false
-            }
-        }
-    }
-
-    private fun processSystemUIWindow() {
-        if (isProcessing) return
-
-        isProcessing = true
-        coroutineScope.launch {
-            try {
-                delay(500) // Wait for UI to load
-                val rootNode = rootInActiveWindow ?: run {
-                    isProcessing = false
-                    return@launch
-                }
-
-                Log.d(TAG, "🔍 Checking SystemUI window, Step: ${currentStep.get()}")
-
-                when (currentStep.get()) {
-                    1 -> {
-                        // Step 1: Click spinner in main dialog
-                        if (handleShareScreenDialog(rootNode)) {
-                            Log.d(TAG, "✅ Spinner handling completed")
-                            currentStep.set(2)
-                            lastActivityTime = System.currentTimeMillis()
-                        } else {
-                            // Fallback: if spinner not found, try to detect chooser directly
-                            if (detectShareChooser(rootNode)) {
-                                Log.d(TAG, "🔄 Fallback: Found chooser directly, moving to step 2")
-                                currentStep.set(2)
-                                lastActivityTime = System.currentTimeMillis()
-                                handler.postDelayed({
-                                    processSystemUIWindow()
-                                }, 500)
-                            }
-                        }
-                    }
-                    2 -> {
-                        // Step 2: Handle chooser dialog
-                        if (detectShareChooser(rootNode)) {
-                            Log.d(TAG, "✅ Chooser dialog detected")
-                            if (handleShareChooser(rootNode)) {
-                                Log.d(TAG, "✅ Chooser handling completed")
-                                currentStep.set(3)
-                                lastActivityTime = System.currentTimeMillis()
-
-                                // Wait a bit then process main dialog
-                                handler.postDelayed({
-                                    processSystemUIWindow()
-                                }, 800)
-                            }
-                        } else {
-                            // Chooser not found, maybe already selected or closed
-                            Log.d(TAG, "⚠️ Chooser not found, checking if we're back to main dialog")
-
-                            // Check if we're back in main dialog with "Share entire screen" selected
-                            if (detectShareScreenDialog(rootNode)) {
-                                val spinner = findNodeById(rootNode, SHARE_SCREEN_MODE_OPTIONS_ID)
-                                if (spinner != null) {
-                                    val spinnerText = getSpinnerText(spinner)
-                                    safeRecycle(spinner)
-
-                                    if (spinnerText.contains("entire screen", ignoreCase = true)) {
-                                        Log.d(TAG, "✅ Already in main dialog with 'Share entire screen' selected")
-                                        currentStep.set(3)
-                                        lastActivityTime = System.currentTimeMillis()
-
-                                        // Process share button immediately
-                                        handler.postDelayed({
-                                            processSystemUIWindow()
-                                        }, 500)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    3 -> {
-                        // Step 3: Click Share screen button
-                        if (handleShareButton(rootNode)) {
-                            Log.d(TAG, "✅ Share button handling completed")
-                            currentStep.set(0) // Reset for next connection
-                            screenShareProcessed = true
-                            lastActivityTime = System.currentTimeMillis()
-                            showToastNotification("✅ Screen sharing started")
-                        } else {
-                            Log.w(TAG, "⚠️ Failed to click share button, retrying...")
-                            // Retry after delay
-                            handler.postDelayed({
-                                if (currentStep.get() == 3) {
-                                    processSystemUIWindow()
-                                }
-                            }, 1000)
-                        }
-                    }
-                }
-
-                safeRecycle(rootNode)
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Error in SystemUI window", e)
+                Log.e(TAG, "❌ Error processing window", e)
+                notifyBugsnag(
+                    "Window Processing Error", mapOf(
+                        "error" to e.message.toString(),
+                        "step" to currentStep.toString(),
+                        "anydeskAccepted" to anydeskAccepted.toString()
+                    ), e
+                )
             } finally {
                 isProcessing = false
             }
@@ -252,593 +177,435 @@ class AnyDeskAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Detect SystemUI Share Screen dialog
+     * Handle AnyDesk incoming connection dialog
      */
-    private fun detectShareScreenDialog(rootNode: AccessibilityNodeInfo): Boolean {
+    private fun handleAnyDeskDialog(rootNode: AccessibilityNodeInfo) {
         try {
-            // 1. Dialog ID bo'yicha tekshirish
+            Log.d(TAG, "🔍 Looking for AnyDesk incoming dialog...")
+
+            val titleNode = findNodeById(rootNode, DIALOG_TITLE_ID)
+            val titleText = titleNode?.text?.toString()?.trim()
+            val isIncomingDialog = titleText?.contains("Incoming", ignoreCase = true) == true
+
+            safeRecycle(titleNode)
+
+            if (isIncomingDialog) {
+                Log.d(TAG, "✅ Found AnyDesk incoming dialog")
+
+                // Get current UI hierarchy for debugging
+                val hierarchy = getCurrentHierarchy(rootNode)
+
+                // Notify Bugsnag about AnyDesk dialog detection
+                notifyBugsnag(
+                    "AnyDesk Dialog Detected", mapOf(
+                        "title" to titleText,
+                        "step" to currentStep.toString(),
+                        "action" to "STARTING_AUTO_ACCEPT",
+                        "hierarchy" to hierarchy
+                    )
+                )
+
+                val acceptButton = findAcceptButton(rootNode)
+                if (acceptButton != null && acceptButton.isClickable) {
+                    Log.d(TAG, "🎯 Clicking ACCEPT button...")
+                    if (performClick(acceptButton)) {
+                        Log.d(TAG, "✅ ACCEPT button clicked!")
+                        anydeskAccepted = true
+                        currentStep = 1
+                        showToastNotification("✅ Connection accepted")
+
+                        // Notify Bugsnag about successful accept
+                        notifyBugsnag(
+                            "AnyDesk Accepted", mapOf(
+                                "step" to currentStep.toString(),
+                                "anydeskAccepted" to anydeskAccepted.toString(),
+                                "action" to "ACCEPT_CLICKED",
+                                "hierarchy" to getCurrentHierarchy(rootNode)
+                            )
+                        )
+
+                        handler.postDelayed({
+                            Log.d(TAG, "⏳ Now looking for share screen dialog...")
+                        }, 800)
+                    }
+                    safeRecycle(acceptButton)
+                } else {
+                    Log.w(TAG, "⚠️ ACCEPT button not found or not clickable")
+                    notifyBugsnag(
+                        "Accept Button Not Found", mapOf(
+                            "step" to currentStep.toString(),
+                            "title" to titleText,
+                            "hierarchy" to getCurrentHierarchy(rootNode)
+                        )
+                    )
+                }
+            } else {
+                Log.d(TAG, "📭 Not an incoming dialog or title not found")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error handling AnyDesk dialog", e)
+            notifyBugsnag(
+                "AnyDesk Dialog Error", mapOf(
+                    "error" to e.message.toString(),
+                    "step" to currentStep.toString(),
+                    "hierarchy" to getCurrentHierarchy(rootNode)
+                ), e
+            )
+        }
+    }
+
+    /**
+     * Handle SystemUI share screen flow
+     */
+    private fun handleSystemUIFlow(rootNode: AccessibilityNodeInfo) {
+        try {
+            Log.d(TAG, "🔍 Handling SystemUI flow - Step: $currentStep")
+
+            when (currentStep) {
+                1 -> handleShareScreenDialog(rootNode)
+                2 -> handleShareChooser(rootNode)
+                3 -> handleShareButton(rootNode)
+                else -> {
+                    if (anydeskAccepted) {
+                        checkForShareScreenDialog(rootNode)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error handling SystemUI flow", e)
+            notifyBugsnag(
+                "SystemUI Flow Error", mapOf(
+                    "error" to e.message.toString(),
+                    "step" to currentStep.toString(),
+                    "hierarchy" to getCurrentHierarchy(rootNode)
+                ), e
+            )
+        }
+    }
+
+    /**
+     * Check for and handle share screen dialog (Step 1)
+     */
+    private fun handleShareScreenDialog(rootNode: AccessibilityNodeInfo) {
+        try {
+            Log.d(TAG, "🔍 Looking for share screen dialog...")
+
             val dialog = findNodeById(rootNode, SHARE_SCREEN_DIALOG_ID)
             if (dialog != null) {
+                Log.d(TAG, "✅ Found share screen dialog")
                 safeRecycle(dialog)
-                Log.d(TAG, "✓ Share screen dialog ID found")
-                return true
-            }
 
-            // 2. Title bo'yicha tekshirish
-            val title = findNodeById(rootNode, SHARE_SCREEN_TITLE_ID)
-            if (title != null) {
-                val titleText = title.text?.toString()?.trim()
-                safeRecycle(title)
-                if (titleText?.contains("Share your screen", ignoreCase = true) == true) {
-                    Log.d(TAG, "✓ Share screen title found: $titleText")
-                    return true
-                }
-            }
+                // Notify Bugsnag about share screen dialog
+                notifyBugsnag(
+                    "Share Screen Dialog Detected", mapOf(
+                        "step" to currentStep.toString(),
+                        "action" to "FOUND_SHARE_DIALOG",
+                        "hierarchy" to getCurrentHierarchy(rootNode)
+                    )
+                )
 
-            // 3. Spinner bo'yicha tekshirish
-            val spinner = findNodeById(rootNode, SHARE_SCREEN_MODE_OPTIONS_ID)
-            if (spinner != null) {
-                safeRecycle(spinner)
-                Log.d(TAG, "✓ Share screen spinner found")
-                return true
-            }
+                val spinner = findNodeById(rootNode, SHARE_SCREEN_SPINNER_ID)
+                if (spinner != null && spinner.isClickable) {
+                    Log.d(TAG, "🎯 Clicking share mode spinner...")
+                    if (performClick(spinner)) {
+                        Log.d(TAG, "✅ Spinner clicked!")
+                        currentStep = 2
 
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error detecting share screen dialog", e)
-        }
+                        // Notify Bugsnag about spinner click
+                        notifyBugsnag(
+                            "Spinner Clicked", mapOf(
+                                "step" to currentStep.toString(),
+                                "action" to "SPINNER_CLICKED",
+                                "hierarchy" to getCurrentHierarchy(rootNode)
+                            )
+                        )
 
-        return false
-    }
-
-    private fun detectShareChooser(rootNode: AccessibilityNodeInfo): Boolean {
-        try {
-            // Method 1: Check for both text options
-            val entireScreen = rootNode.findAccessibilityNodeInfosByText("Share entire screen")
-            val oneApp = rootNode.findAccessibilityNodeInfosByText("Share one app")
-
-            val hasBoth = entireScreen.isNotEmpty() && oneApp.isNotEmpty()
-
-            entireScreen.forEach { safeRecycle(it) }
-            oneApp.forEach { safeRecycle(it) }
-
-            if (hasBoth) {
-                Log.d(TAG, "✓ Chooser dialog detected by text")
-                return true
-            }
-
-            // Method 2: Check for ListView with 2 items
-            val listViews = rootNode.findAccessibilityNodeInfosByViewId("android.widget.ListView")
-            if (listViews.isNotEmpty()) {
-                for (listView in listViews) {
-                    if (listView.childCount == 2) {
-                        var hasShareText = false
-                        for (i in 0 until listView.childCount) {
-                            val child = listView.getChild(i)
-                            if (child != null) {
-                                val childText = child.text?.toString()?.trim()
-                                if (childText != null &&
-                                    (childText.contains("Share", ignoreCase = true))) {
-                                    hasShareText = true
-                                }
-                                safeRecycle(child)
-                            }
-                        }
-                        if (hasShareText) {
-                            listViews.forEach { safeRecycle(it) }
-                            return true
-                        }
+                        handler.postDelayed({
+                            Log.d(TAG, "⏳ Now looking for share chooser...")
+                        }, 500)
                     }
+                    safeRecycle(spinner)
+                } else {
+                    Log.w(TAG, "⚠️ Spinner not found or not clickable")
+                    notifyBugsnag(
+                        "Spinner Not Found", mapOf(
+                            "step" to currentStep.toString(),
+                            "hierarchy" to getCurrentHierarchy(rootNode)
+                        )
+                    )
                 }
-                listViews.forEach { safeRecycle(it) }
+            } else {
+                Log.d(TAG, "📭 Share screen dialog not found")
             }
-
-            // Method 3: Traverse and look for specific bounds
-            val chooserNodes = mutableListOf<AccessibilityNodeInfo>()
-            traverseNodes(rootNode) { node ->
-                try {
-                    // Get bounds safely
-                    val bounds = Rect()
-                    node.getBoundsInScreen(bounds)
-
-                    // Check for chooser bounds [89,1021][991,1399]
-                    if (bounds.left == 89 && bounds.top == 1021 &&
-                        bounds.right == 991 && bounds.bottom == 1399) {
-                        chooserNodes.add(node)
-                    }
-                } catch (e: Exception) {
-                    // Ignore bounds errors
-                }
-                false // continue traversal
-            }
-
-            if (chooserNodes.isNotEmpty()) {
-                chooserNodes.forEach { safeRecycle(it) }
-                Log.d(TAG, "✓ Chooser detected by bounds")
-                return true
-            }
-
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Error detecting share chooser", e)
+            Log.e(TAG, "❌ Error handling share screen dialog", e)
+            notifyBugsnag(
+                "Share Dialog Error", mapOf(
+                    "error" to e.message.toString(),
+                    "step" to currentStep.toString(),
+                    "hierarchy" to getCurrentHierarchy(rootNode)
+                ), e
+            )
         }
-
-        return false
     }
 
     /**
-     * Step 1: Handle main share screen dialog - click spinner
+     * Check if we're already on share screen dialog when step is 0
      */
-    private fun handleShareScreenDialog(rootNode: AccessibilityNodeInfo): Boolean {
+    private fun checkForShareScreenDialog(rootNode: AccessibilityNodeInfo) {
         try {
-            Log.d(TAG, "🎯 Step 1: Looking for share screen spinner...")
-
-            // First, verify it's the main dialog
             val dialog = findNodeById(rootNode, SHARE_SCREEN_DIALOG_ID)
-            if (dialog == null) {
-                Log.d(TAG, "⚠️ Main share dialog not found")
-                return false
-            }
-            safeRecycle(dialog)
-
-            // Find and click the spinner
-            val spinner = findNodeById(rootNode, SHARE_SCREEN_MODE_OPTIONS_ID)
-            if (spinner != null && spinner.isClickable) {
-                Log.d(TAG, "✓ Found spinner, clicking...")
-
-                // Get current text for logging
-                val spinnerText = getSpinnerText(spinner)
-                Log.d(TAG, "Spinner text: $spinnerText")
-
-                if (performClick(spinner)) {
-                    Log.d(TAG, "✅ Spinner clicked successfully")
-
-                    // Wait for chooser to open
-                    handler.postDelayed({
-                        Log.d(TAG, "⏳ Waiting for chooser...")
-                    }, 500)
-                    return true
-                } else {
-                    Log.w(TAG, "⚠️ Failed to click spinner")
-                }
-                safeRecycle(spinner)
+            if (dialog != null) {
+                Log.d(TAG, "📝 Found share screen dialog when step was 0, moving to step 1")
+                safeRecycle(dialog)
+                currentStep = 1
+                handleShareScreenDialog(rootNode)
             } else {
-                Log.w(TAG, "⚠️ Spinner not found or not clickable")
-                safeRecycle(spinner)
+                safeRecycle(dialog)
             }
-
-            // Alternative: Try to find spinner by traversal
-            Log.d(TAG, "🔄 Trying alternative spinner search...")
-            val foundSpinner = findSpinnerByTraversal(rootNode)
-            if (foundSpinner != null) {
-                Log.d(TAG, "✓ Found spinner via traversal, clicking...")
-                if (performClick(foundSpinner)) {
-                    Log.d(TAG, "✅ Spinner clicked via traversal")
-                    safeRecycle(foundSpinner)
-                    return true
-                }
-                safeRecycle(foundSpinner)
-            }
-
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Error in handleShareScreenDialog", e)
-        }
-
-        return false
-    }
-
-    /**
-     * Get text from spinner
-     */
-    private fun getSpinnerText(spinner: AccessibilityNodeInfo): String {
-        return try {
-            for (i in 0 until spinner.childCount) {
-                val child = spinner.getChild(i)
-                if (child != null) {
-                    val text = child.text?.toString()?.trim()
-                    if (!text.isNullOrEmpty()) {
-                        safeRecycle(child)
-                        return text
-                    }
-                    safeRecycle(child)
-                }
-            }
-            "No text found"
-        } catch (e: Exception) {
-            "Error getting text"
+            Log.e(TAG, "❌ Error checking for share screen dialog", e)
+            notifyBugsnag(
+                "Check Share Dialog Error", mapOf(
+                    "error" to e.message.toString(),
+                    "hierarchy" to getCurrentHierarchy(rootNode)
+                ), e
+            )
         }
     }
 
     /**
-     * Find spinner by traversal
+     * Handle share chooser dropdown (Step 2)
      */
-    private fun findSpinnerByTraversal(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        return findNodeByTraversal(rootNode) { node ->
-            node.className?.contains("Spinner", ignoreCase = true) == true &&
-                    node.isClickable && node.isEnabled
-        }
-    }
-
-    /**
-     * Step 2: Handle chooser dialog - select "Share entire screen"
-     */
-    private fun handleShareChooser(rootNode: AccessibilityNodeInfo): Boolean {
+    private fun handleShareChooser(rootNode: AccessibilityNodeInfo) {
         try {
-            Log.d(TAG, "🎯 Step 2: Handling chooser dialog...")
+            Log.d(TAG, "🔍 Looking for share chooser...")
 
-            // Find "Share entire screen" option using multiple methods
-            val entireScreenOption = findShareEntireScreenOption(rootNode)
-            if (entireScreenOption != null) {
-                Log.d(TAG, "✓ Found 'Share entire screen' option, clicking...")
+            val entireScreenNodes = rootNode.findAccessibilityNodeInfosByText("Share entire screen")
+            if (entireScreenNodes.isNotEmpty()) {
+                Log.d(TAG, "✅ Found 'Share entire screen' text")
 
-                // Log the node details for debugging
-                Log.d(TAG, "Node details - Class: ${entireScreenOption.className}, " +
-                        "Clickable: ${entireScreenOption.isClickable}, " +
-                        "Enabled: ${entireScreenOption.isEnabled}")
+                // Notify Bugsnag about chooser detection
+                notifyBugsnag(
+                    "Share Chooser Detected", mapOf(
+                        "step" to currentStep.toString(),
+                        "action" to "FOUND_SHARE_CHOOSER",
+                        "optionText" to "Share entire screen",
+                        "hierarchy" to getCurrentHierarchy(rootNode)
+                    )
+                )
 
-                if (performClick(entireScreenOption)) {
-                    Log.d(TAG, "✅ 'Share entire screen' selected")
-                    safeRecycle(entireScreenOption)
-                    return true
-                } else {
-                    Log.w(TAG, "⚠️ Failed to click 'Share entire screen', trying alternative methods")
+                for (node in entireScreenNodes) {
+                    var clickableNode: AccessibilityNodeInfo? = null
 
-                    // Try alternative click methods
-                    if (performAlternativeClick(entireScreenOption)) {
-                        Log.d(TAG, "✅ 'Share entire screen' selected via alternative click")
-                        safeRecycle(entireScreenOption)
-                        return true
+                    if (node.isClickable) {
+                        clickableNode = node
+                    } else if (node.parent != null && node.parent.isClickable) {
+                        clickableNode = node.parent
                     }
-                }
-                safeRecycle(entireScreenOption)
-            } else {
-                Log.w(TAG, "⚠️ 'Share entire screen' option not found in chooser")
 
-                // Try to find by coordinates (bounds from hierarchy)
-                val optionByBounds = findOptionByBounds(rootNode, 89, 1210, 991, 1399)
-                if (optionByBounds != null && optionByBounds.isClickable) {
-                    Log.d(TAG, "✓ Found option by bounds, clicking...")
-                    if (performClick(optionByBounds)) {
-                        Log.d(TAG, "✅ Option clicked by bounds")
-                        safeRecycle(optionByBounds)
-                        return true
-                    }
-                    safeRecycle(optionByBounds)
-                }
-            }
+                    if (clickableNode != null) {
+                        Log.d(TAG, "🎯 Clicking 'Share entire screen'...")
+                        if (performClick(clickableNode)) {
+                            Log.d(TAG, "✅ 'Share entire screen' selected!")
+                            currentStep = 3
 
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error in handleShareChooser", e)
-        }
+                            // Notify Bugsnag about option selection
+                            notifyBugsnag(
+                                "Share Entire Screen Selected", mapOf(
+                                    "step" to currentStep.toString(),
+                                    "action" to "ENTIRE_SCREEN_SELECTED",
+                                    "hierarchy" to getCurrentHierarchy(rootNode)
+                                )
+                            )
 
-        return false
-    }
+                            handler.postDelayed({
+                                Log.d(TAG, "⏳ Now looking for share button...")
+                            }, 500)
 
-    private fun findShareEntireScreenOption(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        try {
-            // Method 1: Find by text and get clickable parent
-            val nodes = rootNode.findAccessibilityNodeInfosByText("Share entire screen")
-            for (node in nodes) {
-                // Look for clickable parent (LinearLayout)
-                var target: AccessibilityNodeInfo? = node
-                var parent = node.parent
-
-                while (parent != null && target != null && !target.isClickable) {
-                    safeRecycle(target)
-                    target = parent
-                    parent = parent.parent
-                }
-
-                if (target != null && target.isClickable) {
-                    // Recycle other nodes
-                    nodes.forEach { if (it != node) safeRecycle(it) }
-                    return target
-                }
-                safeRecycle(target)
-            }
-            nodes.forEach { safeRecycle(it) }
-
-            // Method 2: Find LinearLayout with text child containing "Share entire screen"
-            val linearLayouts = rootNode.findAccessibilityNodeInfosByViewId("android.widget.LinearLayout")
-            for (layout in linearLayouts) {
-                if (layout.isClickable) {
-                    // Check children for the text
-                    for (i in 0 until layout.childCount) {
-                        val child = layout.getChild(i)
-                        if (child != null) {
-                            val text = child.text?.toString()?.trim()
-                            if (text != null && text.contains("Share entire screen", ignoreCase = true)) {
-                                linearLayouts.forEach { if (it != layout) safeRecycle(it) }
-                                safeRecycle(child)
-                                return layout
+                            if (clickableNode != node) {
+                                safeRecycle(clickableNode)
                             }
-                            safeRecycle(child)
+                            break
+                        }
+
+                        if (clickableNode != node) {
+                            safeRecycle(clickableNode)
                         }
                     }
                 }
-            }
-            linearLayouts.forEach { safeRecycle(it) }
 
+                entireScreenNodes.forEach { safeRecycle(it) }
+            } else {
+                Log.d(TAG, "📭 'Share entire screen' text not found")
+
+                val textNodes = rootNode.findAccessibilityNodeInfosByViewId(SHARE_CHOOSER_TEXT_ID)
+                for (node in textNodes) {
+                    val text = node.text?.toString()?.trim()
+                    Log.d(TAG, "Found text node: $text")
+
+                    if (text?.contains("entire screen", ignoreCase = true) == true) {
+                        Log.d(TAG, "✅ Found entire screen option via ID")
+
+                        notifyBugsnag(
+                            "Entire Screen Option Found", mapOf(
+                                "step" to currentStep.toString(),
+                                "optionText" to text,
+                                "foundBy" to "ID",
+                                "hierarchy" to getCurrentHierarchy(rootNode)
+                            )
+                        )
+
+                        val parent = node.parent
+                        if (parent != null && parent.isClickable) {
+                            Log.d(TAG, "🎯 Clicking via parent...")
+                            if (performClick(parent)) {
+                                Log.d(TAG, "✅ Option selected!")
+                                currentStep = 3
+
+                                notifyBugsnag(
+                                    "Option Selected via Parent", mapOf(
+                                        "step" to currentStep.toString(),
+                                        "action" to "OPTION_SELECTED",
+                                        "hierarchy" to getCurrentHierarchy(rootNode)
+                                    )
+                                )
+
+                                handler.postDelayed({
+                                    Log.d(TAG, "⏳ Now looking for share button...")
+                                }, 500)
+
+                                safeRecycle(parent)
+                                break
+                            }
+                            safeRecycle(parent)
+                        }
+                    }
+                }
+                textNodes.forEach { safeRecycle(it) }
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Error finding share entire screen", e)
-        }
-
-        return null
-    }
-
-    private fun findOptionByBounds(rootNode: AccessibilityNodeInfo, left: Int, top: Int, right: Int, bottom: Int): AccessibilityNodeInfo? {
-        return findNodeByTraversal(rootNode) { node ->
-            try {
-                val bounds = Rect()
-                node.getBoundsInScreen(bounds)
-                bounds.left == left && bounds.top == top &&
-                        bounds.right == right && bounds.bottom == bottom &&
-                        node.isClickable
-            } catch (e: Exception) {
-                false
-            }
+            Log.e(TAG, "❌ Error handling share chooser", e)
+            notifyBugsnag(
+                "Share Chooser Error", mapOf(
+                    "error" to e.message.toString(),
+                    "step" to currentStep.toString(),
+                    "hierarchy" to getCurrentHierarchy(rootNode)
+                ), e
+            )
         }
     }
 
     /**
-     * Step 3: Handle share button in main dialog
+     * Handle share button (Step 3)
      */
-    private fun handleShareButton(rootNode: AccessibilityNodeInfo): Boolean {
+    private fun handleShareButton(rootNode: AccessibilityNodeInfo) {
         try {
-            Log.d(TAG, "🎯 Step 3: Looking for 'Share screen' button...")
+            Log.d(TAG, "🔍 Looking for share button...")
 
-            // Check spinner text to confirm "Share entire screen" is selected
-            val spinner = findNodeById(rootNode, SHARE_SCREEN_MODE_OPTIONS_ID)
-            if (spinner != null) {
-                val spinnerText = getSpinnerText(spinner)
-                Log.d(TAG, "Current spinner text: $spinnerText")
-                safeRecycle(spinner)
+            val shareButton = findNodeById(rootNode, SHARE_SCREEN_NEXT_BUTTON_ID)
+            if (shareButton != null && shareButton.isClickable) {
+                val buttonText = shareButton.text?.toString()?.trim()
+                Log.d(TAG, "✅ Found share button with text: $buttonText")
 
-                if (!spinnerText.contains("entire screen", ignoreCase = true)) {
-                    Log.w(TAG, "⚠️ Spinner doesn't show 'Share entire screen', current: $spinnerText")
-                    return false
-                }
-            }
+                if (buttonText.equals("Share screen", ignoreCase = true) ||
+                    buttonText.equals("Next", ignoreCase = true)
+                ) {
 
-            // Find and click the "Share screen" button using multiple methods
-            val shareButton = findShareScreenButton(rootNode)
-            if (shareButton != null) {
-                Log.d(TAG, "✓ Found 'Share screen' button, clicking...")
-                if (performClick(shareButton)) {
-                    Log.d(TAG, "✅ 'Share screen' button clicked successfully")
-                    safeRecycle(shareButton)
-                    return true
-                } else {
-                    Log.w(TAG, "⚠️ Failed to click 'Share screen' button, trying alternative...")
+                    Log.d(TAG, "🎯 Clicking $buttonText button...")
+                    if (performClick(shareButton)) {
+                        Log.d(TAG, "✅ $buttonText button clicked!")
 
-                    // Try alternative click
-                    if (performAlternativeClick(shareButton)) {
-                        Log.d(TAG, "✅ 'Share screen' button clicked via alternative")
-                        safeRecycle(shareButton)
-                        return true
+                        // Notify Bugsnag about successful share
+                        notifyBugsnag(
+                            "Screen Sharing Started", mapOf(
+                                "buttonText" to buttonText.toString(),
+                                "step" to currentStep.toString(),
+                                "action" to "SHARE_STARTED",
+                                "result" to "SUCCESS",
+                                "hierarchy" to getCurrentHierarchy(rootNode)
+                            )
+                        )
+
+                        resetStates()
+                        showToastNotification("✅ Screen sharing started")
+                    } else {
+                        notifyBugsnag(
+                            "Share Button Click Failed", mapOf(
+                                "buttonText" to buttonText.toString(),
+                                "step" to currentStep.toString().toString(),
+                                "action" to "SHARE_CLICK_FAILED",
+                                "hierarchy" to getCurrentHierarchy(rootNode)
+                            )
+                        )
                     }
                 }
                 safeRecycle(shareButton)
             } else {
-                Log.w(TAG, "⚠️ 'Share screen' button not found")
+                Log.w(TAG, "⚠️ Share button not found by ID")
+                safeRecycle(shareButton)
 
-                // Try to find by bounds from hierarchy
-                val buttonByBounds = findNodeByTraversal(rootNode) { node ->
-                    try {
-                        node.className?.contains("Button") == true &&
-                                node.isClickable
-                    } catch (e: Exception) {
-                        false
+                val shareButtons = rootNode.findAccessibilityNodeInfosByText("Share screen")
+                val nextButtons = rootNode.findAccessibilityNodeInfosByText("Next")
+
+                val allButtons = shareButtons + nextButtons
+                for (button in allButtons) {
+                    if (button.isClickable) {
+                        val text = button.text?.toString()?.trim()
+                        Log.d(TAG, "✅ Found button via text: $text")
+
+                        if (performClick(button)) {
+                            Log.d(TAG, "✅ Button clicked!")
+
+                            notifyBugsnag(
+                                "Screen Sharing Started via Text", mapOf(
+                                    "buttonText" to text.toString(),
+                                    "step" to currentStep.toString(),
+                                    "action" to "SHARE_STARTED",
+                                    "foundBy" to "TEXT",
+                                    "hierarchy" to getCurrentHierarchy(rootNode)
+                                )
+                            )
+
+                            resetStates()
+                            showToastNotification("✅ Screen sharing started")
+                            break
+                        }
                     }
                 }
 
-                if (buttonByBounds != null) {
-                    Log.d(TAG, "✓ Found button by traversal, clicking...")
-                    if (performClick(buttonByBounds)) {
-                        Log.d(TAG, "✅ Button clicked")
-                        safeRecycle(buttonByBounds)
-                        return true
-                    }
-                    safeRecycle(buttonByBounds)
-                }
+                allButtons.forEach { safeRecycle(it) }
             }
-
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Error in handleShareButton", e)
+            Log.e(TAG, "❌ Error handling share button", e)
+            notifyBugsnag(
+                "Share Button Error", mapOf(
+                    "error" to e.message.toString(),
+                    "step" to currentStep.toString(),
+                    "hierarchy" to getCurrentHierarchy(rootNode)
+                ), e
+            )
         }
-
-        return false
-    }
-
-    private fun findShareScreenButton(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        try {
-            // Method 1: Find by ID
-            val button = findNodeById(rootNode, SHARE_SCREEN_NEXT_BUTTON_ID)
-            if (button != null && button.isClickable) {
-                val text = button.text?.toString()?.trim()
-                if (text.equals("Share screen", ignoreCase = true) ||
-                    text.equals("Share", ignoreCase = true) ||
-                    text.equals("Start", ignoreCase = true)) {
-                    return button
-                }
-                safeRecycle(button)
-            }
-
-            // Method 2: Find by text
-            val buttons = rootNode.findAccessibilityNodeInfosByText("Share screen")
-            for (btn in buttons) {
-                if (btn.isClickable && btn.className?.contains("Button") == true) {
-                    val text = btn.text?.toString()?.trim()
-                    if (text.equals("Share screen", ignoreCase = true)) {
-                        buttons.forEach { if (it != btn) safeRecycle(it) }
-                        return btn
-                    }
-                }
-            }
-            buttons.forEach { safeRecycle(it) }
-
-            // Method 3: Find any button with "Share" text
-            val shareButtons = rootNode.findAccessibilityNodeInfosByText("Share")
-            for (btn in shareButtons) {
-                if (btn.isClickable && btn.className?.contains("Button") == true) {
-                    shareButtons.forEach { if (it != btn) safeRecycle(it) }
-                    return btn
-                }
-            }
-            shareButtons.forEach { safeRecycle(it) }
-
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error finding share button", e)
-        }
-
-        return null
     }
 
     /**
-     * Check timeout and reset state if needed
+     * Find ACCEPT button in AnyDesk dialog
      */
-    private fun checkTimeoutReset() {
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastActivityTime > STATE_TIMEOUT) {
-            Log.d(TAG, "🔄 Resetting state due to timeout (${STATE_TIMEOUT/1000}s)")
-            currentStep.set(0)
-            screenShareProcessed = false
-            lastActivityTime = currentTime
-        }
-    }
-
-    private fun detectIncomingDialog(rootNode: AccessibilityNodeInfo): Boolean {
-        var evidenceCount = 0
-
-        try {
-            // Title check
-            val title = findNodeById(rootNode, DIALOG_TITLE_ID)
-            if (title != null) {
-                val titleText = title.text?.toString()?.trim()
-                if (titleText.equals("Incoming connection request", ignoreCase = true) ||
-                    titleText.equals("Incoming session", ignoreCase = true) ||
-                    titleText?.contains("incoming", ignoreCase = true) == true) {
-                    evidenceCount += 2
-                    Log.d(TAG, "✓ Title matched: $titleText")
-                }
-                safeRecycle(title)
-            }
-
-            // Message check
-            val message = findNodeById(rootNode, DIALOG_MSG_ID)
-            if (message != null) {
-                val messageText = message.text?.toString()?.trim()
-                if (messageText?.contains("would like to", ignoreCase = true) == true ||
-                    messageText?.contains("view your desk", ignoreCase = true) == true ||
-                    messageText?.contains("connect to", ignoreCase = true) == true) {
-                    evidenceCount += 2
-                    Log.d(TAG, "✓ Message pattern found")
-                }
-                safeRecycle(message)
-            }
-
-            // Address/Alias fields
-            val address = findNodeById(rootNode, ADDRESS_TEXT_ID)
-            val alias = findNodeById(rootNode, ALIAS_TEXT_ID)
-            if (address != null || alias != null) {
-                evidenceCount++
-                Log.d(TAG, "✓ Address/Alias field found")
-                safeRecycle(address)
-                safeRecycle(alias)
-            }
-
-            // Permissions section
-            val permissionsTitle = findNodeById(rootNode, PERMISSIONS_TITLE_ID)
-            val permissionsContainer = findNodeById(rootNode, PERMISSIONS_CONTAINER_ID)
-            if (permissionsTitle != null || permissionsContainer != null) {
-                evidenceCount++
-                Log.d(TAG, "✓ Permissions section found")
-                safeRecycle(permissionsTitle)
-                safeRecycle(permissionsContainer)
-            }
-
-            // ACCEPT and DISMISS buttons
-            val acceptButton = findAcceptButton(rootNode)
-            val dismissButton = findDismissButton(rootNode)
-            if (acceptButton != null && dismissButton != null) {
-                evidenceCount += 3
-                Log.d(TAG, "✓ Both ACCEPT and DISMISS buttons found")
-                safeRecycle(acceptButton)
-                safeRecycle(dismissButton)
-            } else {
-                safeRecycle(acceptButton)
-                safeRecycle(dismissButton)
-            }
-
-            // Spinner (Permission profile)
-            val spinner = findNodeById(rootNode, PERMISSION_PROFILE_ID)
-            if (spinner != null) {
-                evidenceCount++
-                Log.d(TAG, "✓ Permission spinner found")
-                safeRecycle(spinner)
-            }
-
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error in dialog detection", e)
-        }
-
-        val detected = evidenceCount >= 4
-        if (detected) {
-            Log.d(TAG, "✅ Dialog confirmed with $evidenceCount evidence points")
-        }
-
-        return detected
-    }
-
-    private fun performAutoAccept(rootNode: AccessibilityNodeInfo): Boolean {
-        try {
-            Log.d(TAG, "🎯 Starting auto-accept...")
-
-            val acceptButton = findAcceptButton(rootNode)
-            if (acceptButton != null) {
-                autoAcceptCount++
-                Log.d(TAG, "🎯 Found ACCEPT button! Clicking... Total accepted: $autoAcceptCount")
-
-                if (performClick(acceptButton)) {
-                    Log.d(TAG, "✅ ACCEPT button clicked successfully!")
-                    showToastNotification("✅ Connection accepted")
-                    safeRecycle(acceptButton)
-                    return true
-                } else {
-                    Log.w(TAG, "⚠️ ACCEPT button click failed")
-                }
-                safeRecycle(acceptButton)
-            } else {
-                Log.w(TAG, "⚠️ ACCEPT button not found")
-            }
-
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error in auto-accept", e)
-        }
-
-        return false
-    }
-
     private fun findAcceptButton(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        // By resource ID
         val byId = findNodeById(rootNode, ACCEPT_BUTTON_ID)
-        if (byId != null && byId.isClickable && byId.isEnabled) {
+        if (byId != null && byId.isClickable) {
             val text = byId.text?.toString()?.trim()
-            if (text.equals("ACCEPT", ignoreCase = true) ||
-                text.equals("ALLOW", ignoreCase = true) ||
-                text.equals("OK", ignoreCase = true)) {
+            if (text.equals("ACCEPT", ignoreCase = true)) {
                 return byId
             }
             safeRecycle(byId)
         }
 
-        // By text
         val buttons = rootNode.findAccessibilityNodeInfosByText("ACCEPT")
         for (button in buttons) {
-            if (button.isClickable && button.isEnabled) {
-                val text = button.text?.toString()?.trim()
-                if (text.equals("ACCEPT", ignoreCase = true)) {
-                    buttons.forEach { if (it != button) safeRecycle(it) }
-                    return button
-                }
+            if (button.isClickable) {
+                buttons.forEach { if (it != button) safeRecycle(it) }
+                return button
             }
         }
         buttons.forEach { safeRecycle(it) }
@@ -846,21 +613,9 @@ class AnyDeskAccessibilityService : AccessibilityService() {
         return null
     }
 
-    private fun findDismissButton(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val byId = findNodeById(rootNode, DISMISS_BUTTON_ID)
-        if (byId != null && byId.isClickable && byId.isEnabled) {
-            val text = byId.text?.toString()?.trim()
-            if (text.equals("DISMISS", ignoreCase = true) ||
-                text.equals("DENY", ignoreCase = true) ||
-                text.equals("CANCEL", ignoreCase = true)) {
-                return byId
-            }
-            safeRecycle(byId)
-        }
-
-        return null
-    }
-
+    /**
+     * Find node by ID
+     */
     private fun findNodeById(rootNode: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? {
         return try {
             val nodes = rootNode.findAccessibilityNodeInfosByViewId(id)
@@ -875,189 +630,250 @@ class AnyDeskAccessibilityService : AccessibilityService() {
             null
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error finding node by ID: $id", e)
+            notifyBugsnag(
+                "Node Find Error", mapOf(
+                    "id" to id,
+                    "error" to e.message.toString(),
+                    "hierarchy" to getCurrentHierarchy(rootNode)
+                ), e
+            )
             null
         }
     }
 
+    /**
+     * Get current UI hierarchy as string for debugging
+     */
+    private fun getCurrentHierarchy(rootNode: AccessibilityNodeInfo): String {
+        return try {
+            val stringBuilder = StringBuilder()
+            dumpNodeHierarchy(rootNode, stringBuilder, 0, 3) // Limit depth to 3 levels
+            stringBuilder.toString()
+        } catch (e: Exception) {
+            "Error getting hierarchy: ${e.message}"
+        }
+    }
+
+    /**
+     * Recursively dump node hierarchy
+     */
+    private fun dumpNodeHierarchy(
+        node: AccessibilityNodeInfo,
+        builder: StringBuilder,
+        depth: Int,
+        maxDepth: Int
+    ) {
+        if (depth > maxDepth) return
+
+        val indent = "  ".repeat(depth)
+        builder.append(indent)
+
+        // Add node info
+        builder.append("Node: ")
+        builder.append("class=").append(node.className?.toString() ?: "null")
+        builder.append(", text=").append(node.text?.toString()?.take(50) ?: "null")
+        builder.append(", id=").append(node.viewIdResourceName ?: "null")
+        builder.append(", clickable=").append(node.isClickable)
+        builder.append(", enabled=").append(node.isEnabled)
+        builder.append(", visible=").append(node.isVisibleToUser)
+
+        // Add bounds if available
+        val bounds = android.graphics.Rect()
+        node.getBoundsInScreen(bounds)
+        builder.append(", bounds=[").append(bounds.left).append(",").append(bounds.top)
+            .append("][").append(bounds.right).append(",").append(bounds.bottom).append("]")
+
+        builder.append("\n")
+
+        // Recursively dump children
+        if (depth < maxDepth) {
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i)
+                if (child != null) {
+                    dumpNodeHierarchy(child, builder, depth + 1, maxDepth)
+                    child.recycle()
+                } else {
+                    builder.append("  ".repeat(depth + 1)).append("null child\n")
+                }
+            }
+        }
+    }
+
+    /**
+     * Perform click on node
+     */
     private fun performClick(node: AccessibilityNodeInfo): Boolean {
         return try {
             Log.d(TAG, "🖱️ Clicking: ${node.className}, text: ${node.text}")
 
             if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                Log.d(TAG, "✓ Click successful")
+                Log.d(TAG, "✓ Click performed")
                 return true
             }
 
-            // Try with focus first
             if (node.performAction(AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS)) {
                 Thread.sleep(50)
                 if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                    Log.d(TAG, "✓ Click via focus successful")
+                    Log.d(TAG, "✓ Click via focus")
                     return true
                 }
             }
 
-            Log.w(TAG, "⚠️ All click methods failed")
             false
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Error performing click", e)
+            Log.e(TAG, "❌ Error clicking node", e)
+            // Get hierarchy from parent if possible
+            val hierarchy = try {
+                val rootNode = rootInActiveWindow
+                if (rootNode != null) {
+                    getCurrentHierarchy(rootNode)
+                } else {
+                    "No root node available"
+                }
+            } catch (ex: Exception) {
+                "Error getting hierarchy: ${ex.message}"
+            }
+
+            notifyBugsnag(
+                "Click Error", mapOf(
+                    "nodeClass" to node.className?.toString().toString(),
+                    "nodeText" to node.text?.toString().toString(),
+                    "error" to e.message.toString(),
+                    "hierarchy" to hierarchy
+                ), e
+            )
             false
         }
     }
 
-    private fun performAlternativeClick(node: AccessibilityNodeInfo): Boolean {
-        return try {
-            Log.d(TAG, "🔄 Trying alternative click methods...")
-
-            // Method 1: Try long click
-            if (node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)) {
-                Log.d(TAG, "✓ Long click successful")
-                return true
-            }
-
-            // Method 2: Try accessibility focus and click
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
-                if (node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)) {
-                    Thread.sleep(100)
-                    if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                        Log.d(TAG, "✓ Focus + click successful")
-                        return true
-                    }
-                }
-            }
-
-            // Method 3: Try to get parent and click
-            val parent = node.parent
-            if (parent != null && parent.isClickable) {
-                Log.d(TAG, "🔄 Trying to click parent instead...")
-                if (performClick(parent)) {
-                    safeRecycle(parent)
-                    return true
-                }
-                safeRecycle(parent)
-            }
-
-            false
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error in alternative click", e)
-            false
-        }
-    }
-
-    private fun findNodeByTraversal(
-        rootNode: AccessibilityNodeInfo,
-        predicate: (AccessibilityNodeInfo) -> Boolean
-    ): AccessibilityNodeInfo? {
-        val queue = mutableListOf<AccessibilityNodeInfo>()
-        queue.add(rootNode)
-
-        while (queue.isNotEmpty()) {
-            val current = queue.removeAt(0)
-
-            try {
-                if (predicate(current)) {
-                    // Recycle remaining nodes in queue
-                    queue.forEach { if (it != current) safeRecycle(it) }
-                    return current
-                }
-
-                // Add children
-                for (i in 0 until current.childCount) {
-                    val child = current.getChild(i)
-                    if (child != null) {
-                        queue.add(child)
-                    }
-                }
-
-                // Don't recycle root node here
-                if (current != rootNode) {
-                    safeRecycle(current)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in traversal", e)
-            }
-        }
-
-        return null
-    }
-
-    private fun traverseNodes(
-        rootNode: AccessibilityNodeInfo,
-        action: (AccessibilityNodeInfo) -> Boolean
+    /**
+     * Notify Bugsnag with custom data
+     */
+    private fun notifyBugsnag(
+        message: String,
+        metadata: Map<String, String> = emptyMap(),
+        exception: Exception? = null
     ) {
-        val queue = mutableListOf<AccessibilityNodeInfo>()
-        queue.add(rootNode)
-
-        while (queue.isNotEmpty()) {
-            val current = queue.removeAt(0)
-
-            try {
-                val shouldStop = action(current)
-                if (shouldStop) {
-                    queue.forEach { safeRecycle(it) }
-                    safeRecycle(current)
-                    return
-                }
-
-                // Add children
-                for (i in 0 until current.childCount) {
-                    val child = current.getChild(i)
-                    if (child != null) {
-                        queue.add(child)
+        try {
+            if (exception != null) {
+                Bugsnag.notify(exception) { event ->
+                    event.severity = com.bugsnag.android.Severity.ERROR
+                    event.addMetadata("custom", "message", message)
+                    metadata.forEach { (key, value) ->
+                        event.addMetadata("custom", key, value)
                     }
+                    event.addMetadata("state", "anydeskAccepted", anydeskAccepted.toString())
+                    event.addMetadata("state", "currentStep", currentStep.toString())
+                    event.addMetadata("state", "isProcessing", isProcessing)
+                    return@notify true
                 }
-
-                // Don't recycle root node here
-                if (current != rootNode) {
-                    safeRecycle(current)
+            } else {
+                val runtimeException = RuntimeException(message)
+                Bugsnag.notify(runtimeException) { event ->
+                    event.severity = com.bugsnag.android.Severity.INFO
+                    event.addMetadata("custom", "message", message)
+                    metadata.forEach { (key, value) ->
+                        event.addMetadata("custom", key, value)
+                    }
+                    event.addMetadata("state", "anydeskAccepted", anydeskAccepted.toString())
+                    event.addMetadata("state", "currentStep", currentStep.toString())
+                    event.addMetadata("state", "isProcessing", isProcessing.toString())
+                    return@notify true
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in traversal", e)
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to notify Bugsnag", e)
         }
     }
 
+    /**
+     * Start polling for window changes
+     */
+    private fun startPolling() {
+        if (!isPollingActive) {
+            isPollingActive = true
+            Log.d(TAG, "🔄 Starting polling...")
+            notifyBugsnag("Polling Started", mapOf("action" to "POLLING_STARTED"))
+            handler.postDelayed(pollingRunnable, 1000)
+        }
+    }
+
+    /**
+     * Stop polling
+     */
+    private fun stopPolling() {
+        isPollingActive = false
+        handler.removeCallbacks(pollingRunnable)
+        Log.d(TAG, "🛑 Stopped polling")
+        notifyBugsnag("Polling Stopped", mapOf("action" to "POLLING_STOPPED"))
+    }
+
+    /**
+     * Poll for windows periodically
+     */
+    private fun pollForWindows() {
+        if (!isPollingActive) return
+
+        Log.d(TAG, "🔍 Polling for windows...")
+        processCurrentWindow()
+
+        handler.postDelayed(pollingRunnable, 1000)
+    }
+
+    /**
+     * Reset all states
+     */
+    private fun resetStates() {
+        Log.d(TAG, "🔄 Resetting states")
+        notifyBugsnag(
+            "States Reset", mapOf(
+                "old_anydeskAccepted" to anydeskAccepted.toString(),
+                "old_currentStep" to currentStep.toString(),
+                "action" to "STATES_RESET"
+            )
+        )
+        anydeskAccepted = false
+        currentStep = 0
+    }
+
+    /**
+     * Safe recycle node
+     */
     private fun safeRecycle(node: AccessibilityNodeInfo?) {
         if (node == null) return
-
         try {
             node.recycle()
         } catch (e: Exception) {
-            // Ignore, node might already be recycled
+            // Ignore
         }
     }
 
+    /**
+     * Show toast notification
+     */
     private fun showToastNotification(message: String) {
         Log.i(TAG, "📢 $message")
-    }
-
-    private fun logStats() {
-        Log.i(TAG, "📊 === Stats ===")
-        Log.i(TAG, "📊 Dialogs: $dialogDetectedCount")
-        Log.i(TAG, "📊 Auto-accepted: $autoAcceptCount")
-        Log.i(TAG, "📊 Screen share processed: $screenShareProcessed")
-        Log.i(TAG, "📊 Current step: ${currentStep.get()}")
-        Log.i(TAG, "📊 =============")
+        notifyBugsnag("Toast Notification", mapOf("message" to message))
     }
 
     override fun onInterrupt() {
         Log.d(TAG, "🔴 Service Interrupted")
         isServiceEnabled = false
+        notifyBugsnag("Service Interrupted", mapOf("action" to "SERVICE_INTERRUPTED"))
+        stopPolling()
         handler.removeCallbacksAndMessages(null)
         isProcessing = false
-        currentStep.set(0)
-        screenShareProcessed = false
-        logStats()
+        resetStates()
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
         Log.d(TAG, "🔴 Service Unbound")
         isServiceEnabled = false
+        notifyBugsnag("Service Unbound", mapOf("action" to "SERVICE_UNBOUND"))
+        stopPolling()
         handler.removeCallbacksAndMessages(null)
         isProcessing = false
-        currentStep.set(0)
-        screenShareProcessed = false
-        logStats()
+        resetStates()
         return super.onUnbind(intent)
     }
 
@@ -1065,10 +881,10 @@ class AnyDeskAccessibilityService : AccessibilityService() {
         super.onDestroy()
         Log.d(TAG, "🔴 Service Destroyed")
         isServiceEnabled = false
+        notifyBugsnag("Service Destroyed", mapOf("action" to "SERVICE_DESTROYED"))
+        stopPolling()
         handler.removeCallbacksAndMessages(null)
         isProcessing = false
-        currentStep.set(0)
-        screenShareProcessed = false
-        logStats()
+        resetStates()
     }
 }
